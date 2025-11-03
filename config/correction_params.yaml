@@ -1,0 +1,25 @@
+/**:
+  ros__parameters:
+    # Livox点云输入话题
+    livox_topic: "/rear_lidar"
+    
+    # 转换后的PointCloud2输出话题
+    output_topic: "/livox/pointcloud2"
+    
+    # 输出点云的frame_id
+    output_frame_id: "livox_frame"
+    
+    # 是否启用xyz滤波
+    enable_xyz_filter: true
+    
+    # X方向滤波范围 (单位：米)
+    x_filter_min: 0.10
+    x_filter_max: 50.0
+    
+    # Y方向滤波范围 (单位：米)
+    y_filter_min: -50.0
+    y_filter_max: 50.0
+    
+    # Z方向滤波范围 (单位：米)
+    z_filter_min: -5.0
+    z_filter_max: 5.0
