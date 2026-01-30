@@ -14,20 +14,26 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common filters)
 find_package(pcl_conversions REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 # 包含目录
 include_directories(
   include
   ${PCL_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIR}
 )
 
 # 添加可执行文件
 add_executable(${PROJECT_NAME}_node
   src/main.cpp
   src/correction_node.cpp
+  src/pcl_tool.cpp
 )
 
 # 设置依赖
@@ -35,8 +41,11 @@ ament_target_dependencies(${PROJECT_NAME}_node
   rclcpp
   sensor_msgs
   std_msgs
+  nav_msgs
   livox_ros_driver2
   pcl_conversions
+  tf2
+  tf2_geometry_msgs
 )
 
 # 链接PCL库

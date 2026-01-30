@@ -5,9 +5,13 @@ CorrectionNode::CorrectionNode(const rclcpp::NodeOptions & options)
 {
     // 声明和获取参数
     this->declare_parameter<std::string>("livox_topic", "/livox/lidar");
+    this->declare_parameter<std::string>("odom_topic", "/odom");
     this->declare_parameter<std::string>("output_topic", "/livox/pointcloud2");
     this->declare_parameter<std::string>("output_frame_id", "livox_frame");
     this->declare_parameter<bool>("use_best_effort_qos", false);
+    
+    // 声明畸变矫正参数
+    this->declare_parameter<bool>("enable_distortion_correction", true);
     
     // 声明滤波参数
     this->declare_parameter<bool>("enable_xyz_filter", true);
@@ -19,8 +23,12 @@ CorrectionNode::CorrectionNode(const rclcpp::NodeOptions & options)
     this->declare_parameter<double>("z_filter_max", 5.0);
 
     this->get_parameter("livox_topic", livox_topic_);
+    this->get_parameter("odom_topic", odom_topic_);
     this->get_parameter("output_topic", output_topic_);
     this->get_parameter("output_frame_id", output_frame_id_);
+    
+    // 获取畸变矫正参数
+    this->get_parameter("enable_distortion_correction", enable_distortion_correction_);
     
     // 获取滤波参数
     this->get_parameter("enable_xyz_filter", enable_xyz_filter_);
@@ -31,11 +39,17 @@ CorrectionNode::CorrectionNode(const rclcpp::NodeOptions & options)
     this->get_parameter("z_filter_min", z_filter_min_);
     this->get_parameter("z_filter_max", z_filter_max_);
 
-    
+    // 创建订阅者
     livox_sub_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
         livox_topic_,
         10,
         std::bind(&CorrectionNode::livoxCloudCallback, this, std::placeholders::_1)
+    );
+
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic_,
+        rclcpp::QoS(rclcpp::KeepLast(100)).best_effort(),
+        std::bind(&CorrectionNode::odomCallback, this, std::placeholders::_1)
     );
 
     // 创建发布者 - 使用Reliable QoS以兼容RViz
@@ -45,8 +59,10 @@ CorrectionNode::CorrectionNode(const rclcpp::NodeOptions & options)
     );
 
     RCLCPP_INFO(this->get_logger(), "Correction Node initialized");
-    RCLCPP_INFO(this->get_logger(), "Subscribing to: %s", livox_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Subscribing to Livox: %s", livox_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Subscribing to Odom: %s", odom_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "Publishing to: %s", output_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Distortion Correction enabled: %s", enable_distortion_correction_ ? "true" : "false");
     RCLCPP_INFO(this->get_logger(), "XYZ Filter enabled: %s", enable_xyz_filter_ ? "true" : "false");
     if (enable_xyz_filter_) {
         RCLCPP_INFO(this->get_logger(), "X filter range: [%.2f, %.2f]", x_filter_min_, x_filter_max_);
@@ -55,130 +71,106 @@ CorrectionNode::CorrectionNode(const rclcpp::NodeOptions & options)
     }
 }
 
+void CorrectionNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lock(odom_mutex_);
+    
+    odom_buffer_.push_back(msg);
+    
+    // 限制缓存大小
+    while (odom_buffer_.size() > MAX_ODOM_BUFFER_SIZE) {
+        odom_buffer_.pop_front();
+    }
+}
+
 void CorrectionNode::livoxCloudCallback(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
 {
-    RCLCPP_INFO(this->get_logger(), "Received Livox message with %u points", msg->point_num);
+    // RCLCPP_INFO(this->get_logger(), "Received Livox message with %u points", msg->point_num);
     
     if (msg->point_num == 0) {
         RCLCPP_WARN(this->get_logger(), "Received empty point cloud");
         return;
     }
 
-    // 转换为PointCloud2格式
-    auto cloud_msg = convertToPointCloud2(msg);
+    // 1. 转换Livox CustomMsg为点云数据
+    auto point_data = convertToPointData(msg);
     
-    // 应用xyz滤波
-    if (enable_xyz_filter_) {
-        cloud_msg = applyXYZFilter(cloud_msg);
-        RCLCPP_INFO(this->get_logger(), "After filtering: %u points", cloud_msg.width);
+    if (point_data.empty()) {
+        RCLCPP_WARN(this->get_logger(), "Failed to convert point cloud");
+        return;
     }
     
-    // 发布点云
-    cloud_pub_->publish(cloud_msg);
+    size_t original_size = point_data.size();
     
-    RCLCPP_INFO(this->get_logger(), "Published PointCloud2 with %u points to %s", 
-                cloud_msg.width, output_topic_.c_str());
-}
-
-sensor_msgs::msg::PointCloud2 CorrectionNode::convertToPointCloud2(
-    const livox_ros_driver2::msg::CustomMsg::SharedPtr& livox_msg)
-{
+    // 2. 应用畸变矫正
+    if (enable_distortion_correction_) {
+        std::lock_guard<std::mutex> lock(odom_mutex_);
+        
+        if (odom_buffer_.size() < 2) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Insufficient odometry data for distortion correction (have %zu, need >= 2)", 
+                odom_buffer_.size());
+        } else {
+            rclcpp::Time cloud_time(msg->header.stamp);
+            pcl_tool::applyDistortionCorrection(point_data, cloud_time, odom_buffer_);
+            RCLCPP_INFO(this->get_logger(), "Applied distortion correction");
+        }
+    }
+    
+    // 3. 应用xyz滤波
+    if (enable_xyz_filter_) {
+        pcl_tool::applyXYZFilter(
+            point_data,
+            x_filter_min_, x_filter_max_,
+            y_filter_min_, y_filter_max_,
+            z_filter_min_, z_filter_max_
+        );
+        // RCLCPP_INFO(this->get_logger(), "After filtering: %zu points (from %zu)", 
+        //             point_data.size(), original_size);
+    }
+    
+    // 4. 转换为PointCloud2格式并发布
+    pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+    pcl_cloud->points.reserve(point_data.size());
+    for (const auto& pd : point_data) {
+        pcl_cloud->points.push_back(pd.point);
+    }
+    pcl_cloud->width = pcl_cloud->points.size();
+    pcl_cloud->height = 1;
+    pcl_cloud->is_dense = false;
+    
     sensor_msgs::msg::PointCloud2 cloud_msg;
-    
-    // 设置header
-    cloud_msg.header = livox_msg->header;
+    pcl::toROSMsg(*pcl_cloud, cloud_msg);
+    cloud_msg.header = msg->header;
     if (cloud_msg.header.frame_id.empty()) {
         cloud_msg.header.frame_id = output_frame_id_;
     }
     
-    // 设置点云属性
-    cloud_msg.height = 1;
-    cloud_msg.width = livox_msg->point_num;
-    cloud_msg.is_dense = false;
-    cloud_msg.is_bigendian = false;
+    cloud_pub_->publish(cloud_msg);
     
-    // 定义PointCloud2的字段
-    sensor_msgs::PointCloud2Modifier modifier(cloud_msg);
-    modifier.setPointCloud2Fields(7,
-        "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "z", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "intensity", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "tag", 1, sensor_msgs::msg::PointField::UINT8,
-        "line", 1, sensor_msgs::msg::PointField::UINT8,
-        "offset_time", 1, sensor_msgs::msg::PointField::UINT32
-    );
-    
-    modifier.resize(livox_msg->point_num);
-    
-    // 创建迭代器
-    sensor_msgs::PointCloud2Iterator<float> iter_x(cloud_msg, "x");
-    sensor_msgs::PointCloud2Iterator<float> iter_y(cloud_msg, "y");
-    sensor_msgs::PointCloud2Iterator<float> iter_z(cloud_msg, "z");
-    sensor_msgs::PointCloud2Iterator<float> iter_intensity(cloud_msg, "intensity");
-    sensor_msgs::PointCloud2Iterator<uint8_t> iter_tag(cloud_msg, "tag");
-    sensor_msgs::PointCloud2Iterator<uint8_t> iter_line(cloud_msg, "line");
-    sensor_msgs::PointCloud2Iterator<uint32_t> iter_offset_time(cloud_msg, "offset_time");
+    // RCLCPP_INFO(this->get_logger(), "Published PointCloud2 with %zu points to %s", 
+    //             point_data.size(), output_topic_.c_str());
+}
+
+std::vector<pcl_tool::PointData> CorrectionNode::convertToPointData(
+    const livox_ros_driver2::msg::CustomMsg::SharedPtr& livox_msg)
+{
+    std::vector<pcl_tool::PointData> point_data;
+    point_data.reserve(livox_msg->point_num);
     
     // 填充点云数据
     for (size_t i = 0; i < livox_msg->point_num; ++i) {
-        const auto& point = livox_msg->points[i];
+        const auto& src_point = livox_msg->points[i];
         
-        *iter_x = point.x;
-        *iter_y = point.y;
-        *iter_z = point.z;
-        *iter_intensity = static_cast<float>(point.reflectivity);
-        *iter_tag = point.tag;
-        *iter_line = point.line;
-        *iter_offset_time = point.offset_time;
+        pcl_tool::PointData pd;
+        pd.point.x = src_point.x;
+        pd.point.y = src_point.y;
+        pd.point.z = src_point.z;
+        pd.point.intensity = static_cast<float>(src_point.reflectivity);
+        pd.offset_time = src_point.offset_time;
         
-        ++iter_x;
-        ++iter_y;
-        ++iter_z;
-        ++iter_intensity;
-        ++iter_tag;
-        ++iter_line;
-        ++iter_offset_time;
+        point_data.push_back(pd);
     }
     
-    return cloud_msg;
+    return point_data;
 }
-
-sensor_msgs::msg::PointCloud2 CorrectionNode::applyXYZFilter(
-    const sensor_msgs::msg::PointCloud2& input_cloud)
-{
-    // 转换为PCL点云格式
-    pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    
-    pcl::fromROSMsg(input_cloud, *pcl_cloud);
-    
-    // X方向滤波
-    pcl::PassThrough<pcl::PointXYZ> pass_x;
-    pass_x.setInputCloud(pcl_cloud);
-    pass_x.setFilterFieldName("x");
-    pass_x.setFilterLimits(x_filter_min_, x_filter_max_);
-    pass_x.filter(*filtered_cloud);
-    
-    // Y方向滤波
-    pcl::PassThrough<pcl::PointXYZ> pass_y;
-    pass_y.setInputCloud(filtered_cloud);
-    pass_y.setFilterFieldName("y");
-    pass_y.setFilterLimits(y_filter_min_, y_filter_max_);
-    pass_y.filter(*filtered_cloud);
-    
-    // Z方向滤波
-    pcl::PassThrough<pcl::PointXYZ> pass_z;
-    pass_z.setInputCloud(filtered_cloud);
-    pass_z.setFilterFieldName("z");
-    pass_z.setFilterLimits(z_filter_min_, z_filter_max_);
-    pass_z.filter(*filtered_cloud);
-    
-    // 转换回ROS2消息格式
-    sensor_msgs::msg::PointCloud2 output_cloud;
-    pcl::toROSMsg(*filtered_cloud, output_cloud);
-    output_cloud.header = input_cloud.header;
-    
-    return output_cloud;
-}
-

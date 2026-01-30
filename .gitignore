@@ -1,0 +1,8 @@
+.cache
+.clangd
+.vscode
+build/
+log/
+install/
+compile_commands.json
+

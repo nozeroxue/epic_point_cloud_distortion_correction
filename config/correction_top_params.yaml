@@ -1,16 +1,16 @@
 /**:
   ros__parameters:
     # Livox点云输入话题
-    livox_topic: "/rear_lidar"
+    livox_topic: "/livox/lidar"
     
     # 里程计输入话题
     odom_topic: "/odom"
     
     # 转换后的PointCloud2输出话题
-    output_topic: "/livox/pointcloud2"
+    output_topic: "/livox/pointcloud1"
     
     # 输出点云的frame_id
-    output_frame_id: "livox_frame_head"
+    output_frame_id: "livox_framed"
     
     # 是否启用畸变矫正
     enable_distortion_correction: false
